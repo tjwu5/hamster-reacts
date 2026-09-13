@@ -5,8 +5,9 @@ from mediapipe.tasks.python import vision
 
 from src.detection.parser import parse_face, parse_hands
 from src.calibration import FaceBaseline, record_calibration
+from src.decide import ReactionDecider
 
-# 1. Setup MediaPipe models
+# Setup MediaPipe models
 base_face_options = python.BaseOptions(model_asset_path='models/face_landmarker.task')
 face_options = vision.FaceLandmarkerOptions(
     base_options=base_face_options,
@@ -21,14 +22,13 @@ hand_detector = vision.HandLandmarker.create_from_options(hand_options)
 
 cap = cv2.VideoCapture(1)
 
-# 2. Load or prompt baseline
 baseline = FaceBaseline.load()
 if not baseline:
     baseline = record_calibration(cap, face_detector, seconds=5)
 
-print("\nControls:")
-print("  'c' -> Recalibrate neutral face")
-print("  'q' -> Quit")
+decider = ReactionDecider()
+
+print("\nRunning pipeline with debounced state machine. Press 'q' to quit, 'c' to recalibrate.")
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -41,42 +41,30 @@ while cap.isOpened():
     face = parse_face(face_detector.detect(mp_image))
     hands = parse_hands(hand_detector.detect(mp_image))
 
-    state_label = "Neutral"
-    stats_hud = []
+    z_scores = baseline.compute_z_scores(face.blendshapes) if (face and baseline) else {}
 
-    if face and baseline:
-        # Convert raw blendshapes to personal Z-scores
-        z_scores = baseline.compute_z_scores(face.blendshapes)
+    # State Machine update
+    active_reaction, linger_frames = decider.update(face, hands, z_scores)
 
-        jaw_z = z_scores.get("jawOpen", 0.0)
-        smile_z = (z_scores.get("mouthSmileLeft", 0.0) + z_scores.get("mouthSmileRight", 0.0)) / 2.0
-        brow_up_z = z_scores.get("browInnerUp", 0.0)
+    # Render debounced state
+    if active_reaction:
+        status_text = f"REACTION: [{active_reaction.upper()}] (hold: {linger_frames})"
+        box_color = (0, 255, 0)
+    else:
+        status_text = "REACTION: None"
+        box_color = (150, 150, 150)
 
-        stats_hud.append(f"jawOpen Z: {jaw_z:+.1f}s")
-        stats_hud.append(f"smile Z:   {smile_z:+.1f}s")
+    cv2.putText(frame, status_text, (30, 50),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.85, box_color, 2)
 
-        # Dynamic anomaly triggers (Sigma > 6.0 standard deviations)
-        if jaw_z > 6.0:
-            state_label = f"GASP / JAW DROP (+{jaw_z:.1f}s)"
-        elif smile_z > 5.0:
-            state_label = f"SMILING (+{smile_z:.1f}s)"
+    # Debug arming counters
+    for idx, (pose_name, count) in enumerate(decider.arm_counts.items()):
+        threshold = decider.POSE_CONFIG[pose_name][0]
+        arm_text = f"{pose_name}: {count}/{threshold}"
+        cv2.putText(frame, arm_text, (30, 90 + (idx * 24)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 1)
 
-        # Spatial check: Thinking pose
-        for hand in hands:
-            if face.near(hand.palm_center, face.chin, 0.35):
-                state_label = "Thinking Pose (Hand at chin)"
-                break
-
-    # HUD rendering
-    color = (0, 255, 0) if "Neutral" not in state_label else (200, 200, 200)
-    cv2.putText(frame, f"State: {state_label}", (30, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.85, color, 2)
-
-    for i, stat in enumerate(stats_hud):
-        cv2.putText(frame, stat, (30, 90 + (i * 25)),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 1)
-
-    cv2.imshow("Hamster Reacts - Day 2/3 Preview", frame)
+    cv2.imshow("Hamster Reacts - State Machine", frame)
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         break
