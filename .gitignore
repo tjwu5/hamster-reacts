@@ -216,3 +216,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+models/*.task
+calibration.json
+assets/*.mp4
+.DS_Store
+venv/
