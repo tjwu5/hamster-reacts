@@ -101,7 +101,7 @@ class ReactionDecider:
         # 7. CRYING (Eyes squinched/closed + sad frown / inner brows up)
         # -------------------------------------------------------------
         inner_brow_up = z_scores.get("browInnerUp", 0.0)
-        if blink_z > 3.0 and (frown_z > 3.5 or inner_brow_up > 4.0):
+        if blink_z > 5.0 and (frown_z > 5.5 or inner_brow_up > 4.0):
             return "crying"
 
         # -------------------------------------------------------------
