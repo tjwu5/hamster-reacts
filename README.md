@@ -14,9 +14,11 @@ add more hamsters to your heart's desire.
 Point Zoom at its virtual camera and the whole call sees it.
 
 ```bash
-python main.py              # preview + virtual camera
-python main.py --no-vcam    # preview only
-python main.py --cam 0      # skip auto-discovery, force a camera index
+python main.py                 # preview + virtual camera
+python main.py --background    # no window; keep the camera alive for Zoom / FaceTime / Meet
+python main.py --no-vcam       # preview only
+python main.py --cam 0         # skip auto-discovery, force a camera index
+python main.py --size 1280x720 # force a meeting-friendly output size
 ```
 
 Twelve reactions: shocked, hearts, shh, thumbs up, tongue out, angry, crying,
@@ -33,12 +35,15 @@ are calibrated to *your* face instead of to a number someone guessed.
 python3.12 -m venv venv
 source venv/bin/activate           # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+python main.py                     # must be this python, not system python3
 ```
 
-Python 3.11 or 3.12.
+Python 3.11 or 3.12. `python3` on a recent Mac is often 3.14 — that installs
+MediaPipe 1.x, which aborts with `Service is unavailable`. Always run inside
+the venv.
 
-Then download the two MediaPipe models into `models/` (~10 MB). They are
-gitignored, so this is a one-time step on every machine:
+Then download the two MediaPipe models into `models/` (~10 MB) if they aren't
+there already — first run does this itself:
 
 ```bash
 mkdir -p models
@@ -60,7 +65,8 @@ nothing in the code cares. Unpin one and you have to unpin all three.
 ## Running it
 
 ```bash
-python main.py
+python main.py                 # preview + virtual camera
+python main.py --background    # no window; Ctrl+C to stop
 ```
 
 On first launch (or any time `calibration.json` is missing) it records five
@@ -69,8 +75,9 @@ seconds of a bored face, then starts the overlay loop. Recalibrate later with
 
 | key | does |
 |---|---|
-| `q` | quit |
+| `q` | quit (preview window) |
 | `c` | recalibrate (five seconds, same as first run) |
+| Ctrl+C | quit (`--background`, or the terminal in either mode) |
 
 It prints the cameras it found and which one it picked. On macOS the OpenCV
 index is *not* "0 = built-in": Continuity Camera and OBS Virtual Camera often
@@ -80,33 +87,81 @@ else produces frames. Pass `--cam N` if it guessed wrong.
 
 ---
 
+## How it actually runs
+
+You do **not** want this to start when another app opens the camera. That
+doesn't work, and building a background watcher for "camera in use" would not
+fix it.
+
+macOS (and Windows, and Linux) give a camera to **one** process at a time. If
+Zoom already grabbed FaceTime HD, this script cannot also read it to paint
+hamsters on top. The meeting app has to see a *different* device — a virtual
+camera that *this* process publishes:
+
+```
+physical webcam  →  Hamster Reacts  →  "OBS Virtual Camera"  →  Zoom / FaceTime / Meet
+```
+
+So Hamster Reacts has to be running *first*, holding the real camera, and the
+call app has to pick the virtual one. Leave it running for the whole call
+(preview window, or `--background` with no window).
+
+A later "real app" would be a menu-bar extra that starts at login and keeps
+that virtual camera alive — not something that wakes up when FaceTime's LED
+turns on. Detecting camera use is the wrong trigger: by then the call app
+already owns the hardware.
+
+---
+
 ## Using it in meetings
 
-The virtual camera is on by default, and Zoom, Meet, Teams, Discord and OBS all
-treat it as a normal webcam.
+The virtual camera is on by default. Zoom, FaceTime, Google Meet, Teams,
+Discord and OBS all treat it as a normal webcam once you select it.
 
 **1. Install a backend** (once):
 
 | OS | do this |
 |---|---|
-| macOS | install [OBS Studio](https://obsproject.com), open it once, quit it |
+| macOS | install [OBS Studio](https://obsproject.com), open it once, quit it. Allow the camera extension in System Settings → Privacy & Security if macOS asks. |
 | Windows | install OBS Studio, or run its virtual-camera installer |
 | Linux | `sudo apt install v4l2loopback-dkms` then `sudo modprobe v4l2loopback` |
 
-**2. Run it.** It prints the device it's publishing to:
+**2. Run it** before you join the call:
+
+```bash
+python main.py                 # first time: calibrate + preview, check it looks right
+python main.py --background    # after that: no window, Ctrl+C to stop
+```
+
+It prints the device it's publishing to:
 
 ```
-Virtual camera live: OBS Virtual Camera  <- pick this camera in Zoom / Meet
+Virtual camera live: OBS Virtual Camera
 ```
 
-If the backend isn't installed it warns and falls back to the preview window.
-Pass `--no-vcam` to skip the attempt.
+Output is capped at 1080p (even dimensions) so FaceTime and Meet don't choke
+on a 4K webcam. Pass `--size 1280x720` if an app is still fussy.
 
-**3. Pick that device** in your meeting app — Zoom: Settings → Video → Camera.
-Meet, Teams and Discord all have the same setting under Video.
+If the backend isn't installed, preview mode warns and continues without a
+virtual camera. `--background` exits instead — there's nothing to publish.
 
-**Start this before your meeting app.** Most of them scan for cameras once at
-launch and won't notice a device that appeared later.
+**3. Pick that device** in the call app. Set it once; it usually sticks.
+
+| app | where |
+|---|---|
+| Zoom | Settings → Video → Camera |
+| Google Meet | More (⋮) → Settings → Video → Camera |
+| FaceTime | Video menu (or the camera button in the call) → OBS Virtual Camera |
+| Teams | Settings → Devices → Camera |
+| Discord | Settings → Voice & Video → Camera |
+| Chrome / Safari | lock icon in the URL bar → Camera, then the same in Meet's own settings |
+
+**Start this before the call app.** Most of them scan for cameras once at
+launch and won't notice a device that appeared later. FaceTime in particular
+should be fully quit and reopened after the virtual camera first appears.
+
+Leave Hamster Reacts running for the whole call. Quitting it makes the virtual
+camera go idle (OBS's blue placeholder) and everyone sees that instead of you.
 
 A few things worth knowing before you turn it on in front of colleagues. It
 fires on its own. Everyone sees whatever it decides, so try it on a call with

@@ -1,10 +1,32 @@
 import argparse
 import json
+import platform
+import signal
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+ROOT = Path(__file__).resolve().parent
+
+# python3 on current macOS is often 3.14, which cannot install MediaPipe 0.10.21
+# and will instead pull 1.x — that wheel aborts in DrishtiMetalHelper.
+if __name__ == "__main__" and sys.version_info >= (3, 13):
+    venv_py = ROOT / "venv" / "bin" / "python"
+    hint = (
+        f"  source {ROOT / 'venv' / 'bin' / 'activate'}\n  python main.py\n"
+        if venv_py.exists()
+        else "  python3.12 -m venv venv\n  source venv/bin/activate\n  pip install -r requirements.txt\n  python main.py\n"
+    )
+    sys.exit(
+        f"Python {sys.version_info.major}.{sys.version_info.minor} cannot run this "
+        f"(you ran {sys.executable}).\n"
+        "MediaPipe 0.10.21 needs Python 3.11 or 3.12. Newer Pythons install MediaPipe 1.x,\n"
+        "and that wheel aborts on macOS the moment it opens a detector.\n\n"
+        f"{hint}"
+    )
 
 import cv2
 import numpy as np
@@ -18,11 +40,30 @@ from src.detection.geometry import FaceData, HandData, Point2D
 from src.detection.parser import parse_face, parse_hands
 from src.renderer import OverlayRenderer
 
-ROOT = Path(__file__).resolve().parent
 FACE_MODEL = ROOT / "models" / "face_landmarker.task"
 HAND_MODEL = ROOT / "models" / "hand_landmarker.task"
+MODEL_URLS = {
+    FACE_MODEL.name: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+    HAND_MODEL.name: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+}
 MAX_CAMERA_INDEX = 4
 PREVIEW_WINDOW = "Hamster Reacts - Preview"
+VCAM_MAX_WIDTH = 1920
+VCAM_MAX_HEIGHT = 1080
+DEFAULT_FPS = 30
+
+MEETING_HINT = """
+Pick this camera in the call app (set it once; it sticks):
+
+  Zoom         Settings → Video → Camera
+  Google Meet  More (⋮) → Settings → Video → Camera
+  FaceTime     Video menu → {device}
+  Teams        Settings → Devices → Camera
+  Discord      Settings → Voice & Video → Camera
+  Chrome       lock icon in the URL bar → Camera
+
+Start Hamster Reacts first, then open (or restart) the call app so it sees the device.
+"""
 
 # OpenCV on macOS indexes AVFoundation devices sorted by uniqueID.
 # On this machine that order is typically Continuity, OBS, then FaceTime — not 0=built-in.
@@ -101,6 +142,56 @@ def remap_hand(hand: HandData, meta: LetterboxMeta) -> HandData:
         palm_center=meta.point(hand.palm_center),
         is_open=hand.is_open,
     )
+
+
+def even(n: int) -> int:
+    return n if n % 2 == 0 else n - 1
+
+
+def parse_size(text: str) -> Tuple[int, int]:
+    try:
+        w_str, h_str = text.lower().split("x", 1)
+        width, height = int(w_str), int(h_str)
+    except ValueError:
+        sys.exit(f"Invalid --size {text!r}. Use WIDTHxHEIGHT, e.g. 1280x720.")
+    if width < 16 or height < 16:
+        sys.exit(f"Invalid --size {text!r}. Minimum is 16x16.")
+    return even(width), even(height)
+
+
+def choose_vcam_size(cam_w: int, cam_h: int, override: Optional[str]) -> Tuple[int, int]:
+    """Meeting apps are happiest with even, <=1080p frames. 4K webcams get downscaled."""
+    if override:
+        return parse_size(override)
+    scale = min(1.0, VCAM_MAX_WIDTH / max(cam_w, 1), VCAM_MAX_HEIGHT / max(cam_h, 1))
+    return even(max(16, int(cam_w * scale))), even(max(16, int(cam_h * scale)))
+
+
+def fit_frame(frame: np.ndarray, width: int, height: int) -> np.ndarray:
+    """Letterbox into (width, height) without stretching — what Zoom/FaceTime/Meet expect."""
+    fh, fw = frame.shape[:2]
+    if fw == width and fh == height:
+        return frame
+    scale = min(width / max(fw, 1), height / max(fh, 1))
+    nw, nh = max(1, int(fw * scale)), max(1, int(fh * scale))
+    resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+    canvas = np.zeros((height, width, frame.shape[2]), dtype=frame.dtype)
+    x0 = (width - nw) // 2
+    y0 = (height - nh) // 2
+    canvas[y0:y0 + nh, x0:x0 + nw] = resized
+    return canvas
+
+
+def make_stop_flag():
+    running = {"value": True}
+
+    def handle(signum, _frame):
+        running["value"] = False
+        print("\nStopping...")
+
+    signal.signal(signal.SIGINT, handle)
+    signal.signal(signal.SIGTERM, handle)
+    return running
 
 
 class LandmarkEngine:
@@ -321,7 +412,9 @@ def discover_camera(manual_index: Optional[int] = None) -> Tuple[cv2.VideoCaptur
     return cap, index, name
 
 
-def run_video_calibration(cap, engine: LandmarkEngine, seconds: int = 5) -> FaceBaseline:
+def run_video_calibration(
+    cap, engine: LandmarkEngine, seconds: int = 5, preview: bool = True
+) -> FaceBaseline:
     print(f"\n--- CALIBRATING: Look at the camera with a neutral face for {seconds}s ---")
     samples: Dict[str, List[float]] = {}
     start_t = time.time()
@@ -338,42 +431,64 @@ def run_video_calibration(cap, engine: LandmarkEngine, seconds: int = 5) -> Face
             for name, score in face.blendshapes.items():
                 samples.setdefault(name, []).append(score)
 
-        cv2.putText(
-            frame,
-            f"CALIBRATING: Hold neutral face ({remaining}s)",
-            (30, 80),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.9,
-            (0, 165, 255),
-            2,
-        )
-        cv2.imshow(PREVIEW_WINDOW, frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+        if preview:
+            cv2.putText(
+                frame,
+                f"CALIBRATING: Hold neutral face ({remaining}s)",
+                (30, 80),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.9,
+                (0, 165, 255),
+                2,
+            )
+            cv2.imshow(PREVIEW_WINDOW, frame)
+            if cv2.waitKey(1) & 0xFF == ord("q"):
+                break
 
     means = {k: float(np.mean(v)) for k, v in samples.items() if v}
     stdevs = {k: float(np.std(v)) for k, v in samples.items() if v}
+    if not means:
+        sys.exit("Calibration captured no face. Sit in frame and try again.")
     baseline = FaceBaseline(means, stdevs)
     baseline.save()
     print("--- Calibration Complete & Saved to calibration.json ---\n")
     return baseline
 
 
-def process_pipeline(cap, engine: LandmarkEngine, baseline: FaceBaseline, vcam=None) -> FaceBaseline:
+def process_pipeline(
+    cap,
+    engine: LandmarkEngine,
+    baseline: FaceBaseline,
+    vcam=None,
+    preview: bool = True,
+    vcam_size: Optional[Tuple[int, int]] = None,
+) -> FaceBaseline:
     decider = ReactionDecider()
     renderer = OverlayRenderer(assets_dir=str(ROOT / "assets"))
     fail_count = 0
+    last_vcam_frame: Optional[np.ndarray] = None
+    last_logged_reaction: Optional[str] = None
+    running = make_stop_flag()
 
-    print("Pipeline running! Press 'q' in the preview window to stop, or 'c' to recalibrate.")
+    if preview:
+        print("Pipeline running! Press 'q' in the preview window to stop, or 'c' to recalibrate.")
+    else:
+        print("Pipeline running in the background. Ctrl+C to stop.")
 
-    while True:
+    while running["value"]:
         ok, frame = cap.read()
         if not ok or frame is None or frame.size == 0:
             fail_count += 1
             if fail_count == 1 or fail_count % 30 == 0:
                 print(f"[Warning] Camera frame read failed (x{fail_count}), retrying...")
-            if cv2.waitKey(20) & 0xFF == ord("q"):
-                break
+            if vcam is not None and last_vcam_frame is not None:
+                vcam.send(last_vcam_frame)
+                vcam.sleep_until_next_frame()
+            elif preview:
+                if cv2.waitKey(20) & 0xFF == ord("q"):
+                    break
+            else:
+                time.sleep(0.02)
             continue
         fail_count = 0
 
@@ -385,8 +500,17 @@ def process_pipeline(cap, engine: LandmarkEngine, baseline: FaceBaseline, vcam=N
             renderer.draw_reaction(frame, face, active_reaction)
 
         if vcam is not None:
-            vcam.send(frame)
+            out = frame if vcam_size is None else fit_frame(frame, vcam_size[0], vcam_size[1])
+            vcam.send(out)
             vcam.sleep_until_next_frame()
+            last_vcam_frame = out
+
+        if not preview and active_reaction != last_logged_reaction:
+            print(f"Reaction: {active_reaction or 'none'}")
+            last_logged_reaction = active_reaction
+
+        if not preview:
+            continue
 
         reaction_label = f"[{active_reaction.upper()}]" if active_reaction else "None"
         cv2.putText(
@@ -404,7 +528,7 @@ def process_pipeline(cap, engine: LandmarkEngine, baseline: FaceBaseline, vcam=N
         if key == ord("q"):
             break
         if key == ord("c"):
-            baseline = run_video_calibration(cap, engine, seconds=5)
+            baseline = run_video_calibration(cap, engine, seconds=5, preview=True)
 
     return baseline
 
@@ -415,23 +539,143 @@ def start_virtual_camera(width: int, height: int):
     return pyvirtualcam.Camera(
         width=width,
         height=height,
-        fps=30,
+        fps=DEFAULT_FPS,
         fmt=pyvirtualcam.PixelFormat.BGR,
     )
+
+
+def _version_tuple(version: str) -> Tuple[int, int, int]:
+    bits = []
+    for part in version.split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        bits.append(int(digits or 0))
+        if len(bits) == 3:
+            break
+    while len(bits) < 3:
+        bits.append(0)
+    return bits[0], bits[1], bits[2]
+
+
+def require_supported_runtime() -> None:
+    """MediaPipe 0.10.30+ / 1.x macOS wheels abort in DrishtiMetalHelper. 3.13+ can't install 0.10.21."""
+    py = sys.version_info
+    venv_python = ROOT / "venv" / "bin" / "python"
+    how = (
+        f"  source {ROOT / 'venv' / 'bin' / 'activate'}\n"
+        "  python main.py\n"
+        if venv_python.exists()
+        else "  python3.12 -m venv venv\n"
+        "  source venv/bin/activate\n"
+        "  pip install -r requirements.txt\n"
+        "  python main.py\n"
+    )
+    if py >= (3, 13):
+        sys.exit(
+            f"Python {py.major}.{py.minor} cannot run this (you ran {sys.executable}).\n"
+            "MediaPipe 0.10.21 needs Python 3.11 or 3.12. Newer Pythons install MediaPipe 1.x,\n"
+            "and that wheel aborts on macOS the moment it opens a detector.\n\n"
+            f"{how}"
+        )
+    major, minor, patch = _version_tuple(getattr(mp, "__version__", "0"))
+    too_new = major >= 1 or (major == 0 and minor > 10) or (major == 0 and minor == 10 and patch >= 30)
+    if too_new:
+        sys.exit(
+            f"MediaPipe {mp.__version__} aborts when it opens a detector on macOS.\n"
+            "This project is pinned at 0.10.21. Use the venv:\n\n"
+            f"{how}"
+        )
+
+
+def ensure_models() -> None:
+    (ROOT / "models").mkdir(parents=True, exist_ok=True)
+    for name, url in MODEL_URLS.items():
+        path = ROOT / "models" / name
+        if path.exists():
+            continue
+        print(f"Downloading {name} ...")
+        urllib.request.urlretrieve(url, path)
+
+
+def preflight(model_path: Path) -> None:
+    """Open a detector in a throwaway subprocess: bad macOS builds abort() uncatchably.
+
+    Adapted from its_giving (MIT, Copyright 2026 Gazi).
+    """
+    code = (
+        "import sys\n"
+        "from mediapipe.tasks import python as t\n"
+        "from mediapipe.tasks.python import vision\n"
+        "vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(\n"
+        "    base_options=t.BaseOptions(model_asset_path=sys.argv[1]),\n"
+        "    running_mode=vision.RunningMode.VIDEO, num_faces=1,\n"
+        "    output_face_blendshapes=True)).close()\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code, str(model_path)],
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode == 0:
+        return
+    err = (proc.stderr or "") + (proc.stdout or "")
+    print(
+        f"\nMediaPipe cannot start a detector here (python {platform.python_version()}, "
+        f"mediapipe {getattr(mp, '__version__', '?')}, exit {proc.returncode}).\n"
+    )
+    if "Service is unavailable" in err or "MetalHelper" in err or proc.returncode == -6:
+        venv_py = ROOT / "venv" / "bin" / "python"
+        print(
+            "Cause: mediapipe 0.10.30+ ships macOS wheels that abort on startup.\n"
+            "Fix (Python 3.11 or 3.12) — use the project venv:\n"
+        )
+        if venv_py.exists():
+            print(f"  source {ROOT / 'venv' / 'bin' / 'activate'}\n  python main.py\n")
+        else:
+            print(
+                "  python3.12 -m venv venv\n"
+                "  source venv/bin/activate\n"
+                "  pip install -r requirements.txt\n"
+                "  python main.py\n"
+            )
+        print(
+            "If this python already has a newer MediaPipe, force the pin:\n"
+            '  pip install "mediapipe==0.10.21" "numpy<2" "opencv-python<5" "opencv-contrib-python<5"\n'
+        )
+    else:
+        print(err[-1500:])
+    sys.exit(1)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hamster Reacts live overlay")
     parser.add_argument("--no-vcam", action="store_true", help="Preview window only, skip virtual camera")
+    parser.add_argument(
+        "--background",
+        action="store_true",
+        help="No preview window. Keep the virtual camera alive until Ctrl+C so Zoom / FaceTime / Meet can use it.",
+    )
     parser.add_argument("--cam", type=int, default=None, metavar="INDEX", help="Force a camera index (skip auto-discovery)")
+    parser.add_argument(
+        "--size",
+        default=None,
+        metavar="WxH",
+        help="Virtual camera size (default: camera size, capped at 1920x1080). Example: 1280x720",
+    )
+    parser.add_argument("--skip-check", action="store_true", help="Skip the MediaPipe startup subprocess check")
     return parser.parse_args()
 
 
 def main() -> None:
+    require_supported_runtime()
     args = parse_args()
+    preview = not args.background
 
-    if not FACE_MODEL.exists() or not HAND_MODEL.exists():
-        sys.exit(f"Missing MediaPipe models. Expected:\n  {FACE_MODEL}\n  {HAND_MODEL}")
+    if args.background and args.no_vcam:
+        sys.exit("--background needs the virtual camera. Drop --no-vcam.")
+
+    ensure_models()
+    if not args.skip_check:
+        preflight(FACE_MODEL)
 
     # CPU delegate avoids Metal/GPU graph aborts on macOS while keeping blendshapes.
     face_options = vision.FaceLandmarkerOptions(
@@ -472,20 +716,38 @@ def main() -> None:
 
         baseline = FaceBaseline.load()
         if not baseline:
-            baseline = run_video_calibration(cap, engine, seconds=5)
+            if args.background:
+                print("No calibration.json yet — holding a neutral face for 5s (no preview window).")
+            baseline = run_video_calibration(cap, engine, seconds=5, preview=preview)
 
         if args.no_vcam:
             print("Running in preview-only mode (--no-vcam)...")
-            process_pipeline(cap, engine, baseline, vcam=None)
-        else:
-            try:
-                with start_virtual_camera(width, height) as vcam:
-                    print(f"Virtual camera live: {vcam.device}")
-                    process_pipeline(cap, engine, baseline, vcam=vcam)
-            except Exception as exc:
-                print(f"\n[Warning] Could not start virtual camera: {exc}")
-                print("Falling back to preview-only mode. Pass --no-vcam to skip this attempt.\n")
-                process_pipeline(cap, engine, baseline, vcam=None)
+            process_pipeline(cap, engine, baseline, vcam=None, preview=True)
+            return
+
+        vcam_w, vcam_h = choose_vcam_size(width, height, args.size)
+        print(f"Virtual camera size: {vcam_w}x{vcam_h} @ {DEFAULT_FPS}fps")
+        try:
+            with start_virtual_camera(vcam_w, vcam_h) as vcam:
+                print(f"Virtual camera live: {vcam.device}")
+                print(MEETING_HINT.format(device=vcam.device))
+                process_pipeline(
+                    cap,
+                    engine,
+                    baseline,
+                    vcam=vcam,
+                    preview=preview,
+                    vcam_size=(vcam_w, vcam_h),
+                )
+        except Exception as exc:
+            if args.background:
+                sys.exit(
+                    f"Could not start virtual camera: {exc}\n"
+                    "Install OBS Studio once (macOS/Windows) or v4l2loopback (Linux), then retry."
+                )
+            print(f"\n[Warning] Could not start virtual camera: {exc}")
+            print("Falling back to preview-only mode. Pass --no-vcam to skip this attempt.\n")
+            process_pipeline(cap, engine, baseline, vcam=None, preview=True)
     finally:
         if cap is not None:
             cap.release()
